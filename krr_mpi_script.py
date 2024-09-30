@@ -41,6 +41,7 @@ num_total_samples = len(X_train)
 row_offset_per_process = num_total_samples//size
 num_of_rows_in_last_process = row_offset_per_process + (num_total_samples%size)
 
+local_A = None
 if rank == size - 1:
     local_A = np.zeros((num_of_rows_in_last_process, num_total_samples))
 else:
