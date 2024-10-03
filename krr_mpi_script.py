@@ -27,13 +27,60 @@ else:
     y_train = None
     y_test = None
 
+if rank == 0:
+    X_train_shape = X_train.shape
+    X_test_shape = X_test.shape
+    y_train_shape = y_train.shape
+    y_test_shape = y_test.shape
+else:
+    X_train_shape = None
+    X_test_shape = None
+    y_train_shape = None
+    y_test_shape = None
+print("starting shape broadcast")
+# Broadcast the shapes
+X_train_shape = comm.bcast(X_train_shape, root=0)
+X_test_shape = comm.bcast(X_test_shape, root=0)
+y_train_shape = comm.bcast(y_train_shape, root=0)
+y_test_shape = comm.bcast(y_test_shape, root=0)
+print("end of shape broadcast")
+
+# Initialize arrays on all processes
+if rank != 0:
+    X_train = np.empty(X_train_shape, dtype=np.float64)
+    X_test = np.empty(X_test_shape, dtype=np.float64)
+    y_train = np.empty(y_train_shape, dtype=np.float64)
+    y_test = np.empty(y_test_shape, dtype=np.float64)
+
+print("Starting broadcast")
 #All processes have all data points, might need to initialize array shape in all processes before broadcasting
 comm.Bcast([X_test , MPI.DOUBLE], root=0)
 comm.Bcast([y_test , MPI.DOUBLE], root=0)
 comm.Bcast([y_train , MPI.DOUBLE], root=0)
 comm.Bcast([X_train , MPI.DOUBLE], root=0)
+print("End of broadcast")
 
 #Distributed computation of matrix K
+def local_conjugate_gradient(local_A, local_y, local_alpha, comm, threshold):
+    local_r = local_y - (local_A @ local_alpha)
+    p = np.copy(local_r)
+    squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
+    max_iter = 1000
+    curr_iter = 0
+    while squared_error > threshold:
+        w = local_A @ p
+        s = squared_error/(np.dot(p,w))
+        local_alpha += s*p
+        local_r -= s*w
+        new_squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
+        Beta = new_squared_error/squared_error
+        p = local_r + Beta*p
+        squared_error = new_squared_error
+        curr_iter += 1
+        if (curr_iter > max_iter):
+            break
+    return local_alpha
+
 
 def gaussian_kernel(x, xi, s):
     return np.exp((-np.linalg.norm(x - xi) ** 2)/(2 * s ** 2))
@@ -49,7 +96,8 @@ local_y = None
 local_alpha = None
 
 local_A = np.zeros((number_of_rows_in_process, num_total_samples))
-local_y, local_alpha = np.zeros(number_of_rows_in_process)
+local_y = np.zeros(number_of_rows_in_process)
+local_alpha = np.zeros(number_of_rows_in_process)
 
 for i in range(len(local_A)):
     row_num = rank*row_offset_per_process + i
@@ -74,7 +122,7 @@ else:
 for i in range(len(y_test)):
     for j in range(number_of_rows_in_process):
         row_num = rank*row_offset_per_process + j
-        y_pred[i] += local_alpha[j]*gaussian_kernel(X_test[i], X_train[row_num])
+        local_y_pred[i] += local_alpha[j]*gaussian_kernel(X_test[i], X_train[row_num])
 
 comm.Reduce([local_y_pred, MPI.DOUBLE], [global_y_pred, MPI.DOUBLE], op=MPI.SUM, root=0)
 
@@ -87,20 +135,6 @@ if rank == 0:
 
 
 #Might need barriers before allreduce?
-def local_conjugate_gradient(local_A, local_y, local_alpha, comm, threshold):
-    local_r = local_y - (local_A @ local_alpha)
-    p = np.copy(local_r)
-    squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
-    while squared_error > threshold:
-        w = local_A @ p
-        s = squared_error/(np.dot(p,w))
-        local_alpha += s*p
-        local_r -= s*w
-        new_squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
-        Beta = new_squared_error/squared_error
-        p = local_r + Beta*p
-        squared_error = new_squared_error
-    return local_alpha
 
 
 # Gathering all local matrices into the root process
