@@ -15,6 +15,7 @@ lmbda = float(sys.argv[2]) #Regularization parameter of Gaussian kernel provided
 # Loading and standardizing data
 if rank == 0:
     scaler = StandardScaler()
+    print("loading housing data")
     data = np.genfromtxt('housing.tsv', delimiter='\t', skip_header=0)
     X = data[:, :9]
     y = data[:, 9]
