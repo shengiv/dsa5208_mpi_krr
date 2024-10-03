@@ -27,7 +27,7 @@ else:
     y_train = None
     y_test = None
 
-#All processes have all data points
+#All processes have all data points, might need to initialize array shape in all processes before broadcasting
 comm.Bcast([X_test , MPI.DOUBLE], root=0)
 comm.Bcast([y_test , MPI.DOUBLE], root=0)
 comm.Bcast([y_train , MPI.DOUBLE], root=0)
@@ -41,29 +41,76 @@ def gaussian_kernel(x, xi, s):
 num_total_samples = len(X_train)
 row_offset_per_process = num_total_samples//size
 num_of_rows_in_last_process = row_offset_per_process + (num_total_samples%size)
+number_of_rows_in_process = num_of_rows_in_last_process if rank == size - 1 else row_offset_per_process
+
 
 local_A = None
-if rank == size - 1:
-    local_A = np.zeros((num_of_rows_in_last_process, num_total_samples))
-else:
-    local_A = np.zeros((row_offset_per_process, num_total_samples))
+local_y = None
+local_alpha = None
+
+local_A = np.zeros((number_of_rows_in_process, num_total_samples))
+local_y, local_alpha = np.zeros(number_of_rows_in_process)
 
 for i in range(len(local_A)):
     row_num = rank*row_offset_per_process + i
+    local_y[i] = y_train[row_num]
     for j in range(num_total_samples):
         if row_num == j:
             local_A[i, j] = gaussian_kernel(X_train[row_num], X_train[j], s) + lmbda
         else:
             local_A[i, j] = gaussian_kernel(X_train[row_num], X_train[j], s)
 
-# Gathering all local matrices into the root process
-if rank == 0:
-    A = np.zeros((num_total_samples, num_total_samples))
-else:
-    A = None
+local_alpha = local_conjugate_gradient(local_A, local_y, local_alpha, comm, 1e-6)
 
-# Gather local matrices
-comm.Gather(local_A, A, root=0)
+local_train_se = 0
+local_test_se = 0
+
+local_y_pred = np.zeros(len(y_test))
+if rank == 0:
+    global_y_pred = np.zeros(len(y_test))
+else:
+    global_y_pred = None
+
+for i in range(len(y_test)):
+    for j in range(number_of_rows_in_process):
+        row_num = rank*row_offset_per_process + j
+        y_pred[i] += local_alpha[j]*gaussian_kernel(X_test[i], X_train[row_num])
+
+comm.Reduce([local_y_pred, MPI.DOUBLE], [global_y_pred, MPI.DOUBLE], op=MPI.SUM, root=0)
+
+if rank == 0:
+    mse = mean_squared_error(y_test, global_y_pred)
+    print("Mean squared error of test set = " + str(mse))
+
+
+
+
+
+#Might need barriers before allreduce?
+def local_conjugate_gradient(local_A, local_y, local_alpha, comm, threshold):
+    local_r = local_y - (local_A @ local_alpha)
+    p = np.copy(local_r)
+    squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
+    while squared_error > threshold:
+        w = local_A @ p
+        s = squared_error/(np.dot(p,w))
+        local_alpha += s*p
+        local_r -= s*w
+        new_squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
+        Beta = new_squared_error/squared_error
+        p = local_r + Beta*p
+        squared_error = new_squared_error
+    return local_alpha
+
+
+# Gathering all local matrices into the root process
+# if rank == 0:
+#     A = np.zeros((num_total_samples, num_total_samples))
+# else:
+#     A = None
+
+# # Gather local matrices
+# comm.Gather(local_A, A, root=0)
 
 # The root process now has the complete matrix A = K + lambda*I
 
