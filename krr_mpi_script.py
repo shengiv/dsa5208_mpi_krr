@@ -1,6 +1,6 @@
 from mpi4py import MPI
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 
@@ -9,7 +9,7 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 hyper_param_s = 1.5 # Smoothness parameter of Gaussian kernel provided by user
-hyper_param_lmbda = 0.01 #Regularization parameter of Gaussian kernel provided by user
+hyper_param_lmbda = 0.2 #Regularization parameter of Gaussian kernel provided by user
 
 # Loading and standardizing data
 if rank == 0:
@@ -40,18 +40,17 @@ y_test  = comm.bcast(y_test,  root=0)
 #Distributed computation of matrix A
 def local_conjugate_gradient(local_A, local_y, local_alpha, local_row_offset, global_p, comm, threshold):
     #Initialize local_alpha with 0 vector so initial local_r = local_y
-    local_r = local_y
+    local_r = np.copy(local_y)
     local_p = np.copy(local_r)
     squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
     max_iter = 1000
     curr_iter = 0
+    local_sizes = np.array(comm.allgather(len(local_p)))
+    offsets = np.array(comm.allgather(local_row_offset))
     while squared_error > threshold:
         #Matrix multiplication
-        local_sizes = np.array(comm.allgather(len(local_p)))
-        offsets = np.array(comm.allgather(local_row_offset))
         comm.Allgatherv(local_p, [global_p, local_sizes, offsets, MPI.DOUBLE])
         w = local_A @ global_p
-
         s = squared_error/(np.dot(local_p,w))
         local_alpha += s*local_p
         local_r -= s*w
@@ -85,6 +84,7 @@ local_alpha = np.zeros(number_of_rows_in_process)
 local_row_offset = rank*row_offset_per_process
 global_p = np.zeros(num_total_samples)
 
+
 #Local kernel computation
 for i in range(len(local_A)):
     row_num = rank*row_offset_per_process + i
@@ -94,9 +94,10 @@ for i in range(len(local_A)):
     local_A[i, row_num] += hyper_param_lmbda
 
 
+
 local_alpha = local_conjugate_gradient(local_A, local_y, local_alpha, local_row_offset, global_p, comm, 1e-6)
 
-
+#Test
 # local_train_se = 0
 # local_test_se = 0
 
