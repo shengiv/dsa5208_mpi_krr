@@ -1,20 +1,19 @@
 from mpi4py import MPI
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
-import sys
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-s = float(sys.argv[1]) # Smoothness parameter of Gaussian kernel provided by user
-lmbda = float(sys.argv[2]) #Regularization parameter of Gaussian kernel provided by user
+hyper_param_s = 1.5 # Smoothness parameter of Gaussian kernel provided by user
+hyper_param_lmbda = 0.01 #Regularization parameter of Gaussian kernel provided by user
 
 # Loading and standardizing data
 if rank == 0:
-    scaler = StandardScaler()
+    scaler = MinMaxScaler()
     print("loading housing data")
     data = np.genfromtxt('housing.tsv', delimiter='\t', skip_header=0)
     X = data[:, :9]
@@ -22,114 +21,101 @@ if rank == 0:
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=2)
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
+
 else:
     X_train = None
     X_test = None
     y_train = None
     y_test = None
 
-if rank == 0:
-    X_train_shape = X_train.shape
-    X_test_shape = X_test.shape
-    y_train_shape = y_train.shape
-    y_test_shape = y_test.shape
-else:
-    X_train_shape = None
-    X_test_shape = None
-    y_train_shape = None
-    y_test_shape = None
-print("starting shape broadcast")
-# Broadcast the shapes
-X_train_shape = comm.bcast(X_train_shape, root=0)
-X_test_shape = comm.bcast(X_test_shape, root=0)
-y_train_shape = comm.bcast(y_train_shape, root=0)
-y_test_shape = comm.bcast(y_test_shape, root=0)
-print("end of shape broadcast")
 
-# Initialize arrays on all processes
-if rank != 0:
-    X_train = np.empty(X_train_shape, dtype=np.float64)
-    X_test = np.empty(X_test_shape, dtype=np.float64)
-    y_train = np.empty(y_train_shape, dtype=np.float64)
-    y_test = np.empty(y_test_shape, dtype=np.float64)
 
-print("Starting broadcast")
 #All processes have all data points, might need to initialize array shape in all processes before broadcasting
-comm.Bcast([X_test , MPI.DOUBLE], root=0)
-comm.Bcast([y_test , MPI.DOUBLE], root=0)
-comm.Bcast([y_train , MPI.DOUBLE], root=0)
-comm.Bcast([X_train , MPI.DOUBLE], root=0)
-print("End of broadcast")
+X_train = comm.bcast(X_train, root=0)
+y_train = comm.bcast(y_train, root=0)
+X_test  = comm.bcast(X_test,  root=0)
+y_test  = comm.bcast(y_test,  root=0)
 
-#Distributed computation of matrix K
-def local_conjugate_gradient(local_A, local_y, local_alpha, comm, threshold):
-    local_r = local_y - (local_A @ local_alpha)
-    p = np.copy(local_r)
+
+#Distributed computation of matrix A
+def local_conjugate_gradient(local_A, local_y, local_alpha, local_row_offset, global_p, comm, threshold):
+    #Initialize local_alpha with 0 vector so initial local_r = local_y
+    local_r = local_y
+    local_p = np.copy(local_r)
     squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
     max_iter = 1000
     curr_iter = 0
     while squared_error > threshold:
-        w = local_A @ p
-        s = squared_error/(np.dot(p,w))
-        local_alpha += s*p
+        #Matrix multiplication
+        local_sizes = np.array(comm.allgather(len(local_p)))
+        offsets = np.array(comm.allgather(local_row_offset))
+        comm.Allgatherv(local_p, [global_p, local_sizes, offsets, MPI.DOUBLE])
+        w = local_A @ global_p
+
+        s = squared_error/(np.dot(local_p,w))
+        local_alpha += s*local_p
         local_r -= s*w
         new_squared_error = comm.allreduce(np.dot(local_r, local_r), op=MPI.SUM)
         Beta = new_squared_error/squared_error
-        p = local_r + Beta*p
+        local_p = local_r + Beta*local_p
         squared_error = new_squared_error
         curr_iter += 1
         if (curr_iter > max_iter):
             break
+        #if (curr_iter%50 == 0 and rank == 0):
+        print("iter: " + str(curr_iter) + "squared error: " + str(squared_error))
     return local_alpha
 
+def gaussian_kernel_vectorised(x, xi, s):
+    diff = x - xi
+    squared_norm = np.sum(diff ** 2, axis=1)
+    return np.exp(-squared_norm / (2 * s ** 2))
 
-def gaussian_kernel(x, xi, s):
-    return np.exp((-np.linalg.norm(x - xi) ** 2)/(2 * s ** 2))
+# def gaussian_kernel(x, xi, s):
+#     return np.exp((-np.linalg.norm(x - xi) ** 2)/(2 * s ** 2))
 
 num_total_samples = len(X_train)
 row_offset_per_process = num_total_samples//size
 num_of_rows_in_last_process = row_offset_per_process + (num_total_samples%size)
 number_of_rows_in_process = num_of_rows_in_last_process if rank == size - 1 else row_offset_per_process
 
-
-local_A = None
-local_y = None
-local_alpha = None
-
 local_A = np.zeros((number_of_rows_in_process, num_total_samples))
 local_y = np.zeros(number_of_rows_in_process)
 local_alpha = np.zeros(number_of_rows_in_process)
+local_row_offset = rank*row_offset_per_process
+global_p = np.zeros(num_total_samples)
 
+#Local kernel computation
 for i in range(len(local_A)):
     row_num = rank*row_offset_per_process + i
     local_y[i] = y_train[row_num]
-    for j in range(num_total_samples):
-        if row_num == j:
-            local_A[i, j] = gaussian_kernel(X_train[row_num], X_train[j], s) + lmbda
-        else:
-            local_A[i, j] = gaussian_kernel(X_train[row_num], X_train[j], s)
 
-local_alpha = local_conjugate_gradient(local_A, local_y, local_alpha, comm, 1e-6)
+    local_A[i] = (gaussian_kernel_vectorised(X_train[row_num], X_train, hyper_param_s))
+    local_A[i, row_num] += hyper_param_lmbda
 
-local_train_se = 0
-local_test_se = 0
 
-local_y_pred = np.zeros(len(y_test))
-if rank == 0:
-    global_y_pred = np.zeros(len(y_test))
-else:
-    global_y_pred = None
+local_alpha = local_conjugate_gradient(local_A, local_y, local_alpha, local_row_offset, global_p, comm, 1e-6)
 
-for i in range(len(y_test)):
-    for j in range(number_of_rows_in_process):
-        row_num = rank*row_offset_per_process + j
-        local_y_pred[i] += local_alpha[j]*gaussian_kernel(X_test[i], X_train[row_num])
 
-comm.Reduce([local_y_pred, MPI.DOUBLE], [global_y_pred, MPI.DOUBLE], op=MPI.SUM, root=0)
+# local_train_se = 0
+# local_test_se = 0
 
-if rank == 0:
-    mse = mean_squared_error(y_test, global_y_pred)
-    print("Mean squared error of test set = " + str(mse))
+# local_y_pred = np.zeros(len(y_test))
+# if rank == 0:
+#     global_y_pred = np.zeros(len(y_test))
+# else:
+#     global_y_pred = None
+
+# for i in range(len(y_test)):
+#     for j in range(number_of_rows_in_process):
+#         row_num = rank*row_offset_per_process + j
+#         local_y_pred[i] += local_alpha[j]*gaussian_kernel(X_test[i], X_train[row_num], hyper_param_s)
+
+# comm.Reduce([local_y_pred, MPI.DOUBLE], [global_y_pred, MPI.DOUBLE], op=MPI.SUM, root=0)
+
+# if rank == 0:
+#     mse = mean_squared_error(y_test, global_y_pred)
+#     print("Mean squared error of test set = " + str(mse))
 
 
 
