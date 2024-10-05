@@ -34,10 +34,15 @@ python -m pip install SomePackage
 
 ## Step 2: Install mpi4py
 
-- Run below command in the terminal to install MPI for python if not already done so
+- Run below command in the terminal to install MPI for python if not already done so. 
 
 ```bash
 pip install mpi4py
+```
+
+- If on Windows, either Intel MPI or Microsoft MPI is required. Below is the command to install Intel MPI. 
+
+```bash
 pip install impi-rt
 ```
 
@@ -45,7 +50,8 @@ pip install impi-rt
 
 - Run the below command in the terminal.
 - The number of processes can be changed by replacing the argument `8` below.
+- The argument at the end of the command should either be 0 or 1. 0 indicates to run the kernel ridge regression with the best hyperparameters already tuned previously, 1 indicates to perform hyperparameter tuning (either coarse or fine grain depending on the lines commented out)
 
 ```bash
-mpiexec -n 8 python krr_mpi_script.py
+mpiexec -n 8 python krr_mpi_script.py 0
 ```
